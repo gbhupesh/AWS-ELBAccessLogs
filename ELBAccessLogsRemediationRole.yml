@@ -1,0 +1,51 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'This template will deploy an ConfigRemediation Role for ELB Access Logs remediation, once in each account'
+Parameters:
+  ELBAccessLogsRemediationRoleName:
+    Description: Name that you want to give to the AWS Config Rule.
+    Type: String
+    Default: ELBAccessLogsRemediationRole
+
+Resources:
+  ELBAccessLogsRemediationRole:
+    Type: 'AWS::IAM::Role'
+    Properties: 
+      RoleName: 
+        Ref: ELBAccessLogsRemediationRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'ssm.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+        - PolicyName: aws-config-remediate-elb-accesslogs-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - ec2:CreateTags
+                  - logs:CreateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                  - elasticloadbalancing:DescribeLoadBalancerAttributes
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DescribeTags
+                  - elasticloadbalancing:AddTags
+                  - elasticloadbalancing:ModifyLoadBalancerAttributes
+                Resource: "*"
+
+
+Outputs:
+  ELBAccessLogsRemediationRoleArn:
+    Description: Arn of the IAM Role to perform auto-emediation
+    Value: !GetAtt ELBAccessLogsRemediationRole.Arn

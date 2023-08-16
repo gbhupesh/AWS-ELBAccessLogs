@@ -1,0 +1,291 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'This template will deploy an AWS Config rule to automatically remediate ELB Access Logs enablement'
+Parameters:
+  CustomConfigRuleName:
+    Description: Name that you want to give to the AWS Config Rule.
+    Type: String
+    Default: ConfigRuleForELBAccessLogsEnablement
+  tag1Key:
+    Type: String
+    Default: ELB-Access-logs
+    Description: The Key for the ELBs enabled with Access Logs.
+  tag1Value:
+    Type: String
+    Default: Enabled
+    Description: The Value for the ELBs enabled with Access Logs.
+  MaxExecutionFrequency:
+    Type: String
+    AllowedValues:
+      - One_Hour
+      - Three_Hours
+      - Six_Hours
+      - Twelve_Hours
+      - TwentyFour_Hours
+    Description: The maximum frequency with which AWS Config runs evaluations for a rule.
+    Default: One_Hour
+  LogDestinationBucketAccountID:
+    Description: Name of the S3 bucket in the logging account to send ELB Access Logs.
+    Type: String
+    Default: xx9876543210
+  ConfigRemediationRoleName:
+    Description: Name of the role
+    Type: String
+    Default: ELBAccessLogsRemediationRole
+
+
+Resources:
+  SSMDocumentAWSEnableELBAccessLogs:
+    Type: AWS::SSM::Document
+    Properties: 
+      Content:
+        schemaVersion: "0.3"
+        assumeRole: "{{AutomationAssumeRole}}"
+        description: Custom  SSM Document for AWS-EnableELBAccessLogs
+        outputs:
+          - EnableELBAccessLogs.SuccessfulELBs
+          - EnableELBAccessLogs.FailedELBs
+        parameters:
+          ELBIds:
+            type: StringList
+            description: (Required) A comma separated list of the ELB IDs.
+          LogDestinationType:
+            type: String
+            allowedValues:
+              - s3
+            description: (Optional) The destination type to which the flow log data should be published.
+            default: s3
+          LogDestinationBucketPrefix:
+            type: String
+            description: (Required) The destination to which the flow log data should be published.
+          AutomationAssumeRole:
+            type: String
+            description: (Optional) The ARN of the role that allows Automation to perform the actions on your behalf.
+            default: ''
+        mainSteps:
+          - name: EnableELBAccessLogs
+            action: 'aws:executeScript'
+            onFailure: Abort
+            isCritical: true
+            isEnd: true
+            timeoutSeconds: 600
+            description: |
+              ## EnableELBAccessLogs
+              Enables Access Logs for the target ELBs.
+              ## Inputs
+              * ELBIds: A comma separated list of the ELB IDs.
+              * LogDestinationType: The destination type to which the flow log data should be published.
+              * LogDestinationBucketPrefix: The destination to which the flow log data should be published.
+              ## Output parameters
+              * SuccessfulELBs: A list of ELB IDs for which Access Logs were successfully enabled.
+              * FailedELBs: A mapList of ELB IDs for which Access Logs could not be enabled and the reason for the failure.
+            inputs:
+              Runtime: python3.7
+              Handler: enable_ELB_AccessLogs
+              InputPayload:
+                ELBIds: '{{ELBIds}}'
+                LogDestinationType: '{{LogDestinationType}}'
+                LogDestinationBucketPrefix: '{{LogDestinationBucketPrefix}}'
+              Script: |
+                import boto3
+                import traceback
+                import sys
+                import re
+
+                def enable_ELB_AccessLogs(event, context):
+                    my_session = boto3.session.Session()
+                    my_region = my_session.region_name
+                    elbv2client = boto3.client('elbv2')
+                    elbv1client = boto3.client('elb')
+
+                    FailedELBs = []
+                    SuccessfulELBs = []
+
+                    ELBIds = event['ELBIds']
+                    LogDestinationType  = event['LogDestinationType']
+                    LogDestinationBucketPrefix  = event['LogDestinationBucketPrefix']
+
+                    for elbid in ELBIds:
+                        try:
+                            print("|| Examning ELB : " + elbid)
+                            pattern_elbname = r'^(?!-)(?!.*--)[a-zA-Z0-9-]{1,32}(?<!-)$'
+                            pattern_elbv2_app = r'^(arn:aws(-cn|-us-gov)?:.*\S.*.*loadbalancer\/app\/.*)|^$'
+                            pattern_elbv2_nlb = r'^(arn:aws(-cn|-us-gov)?:.*\S.*.*loadbalancer\/net\/.*)|^$'
+                            match_app_arn = re.match(pattern_elbv2_app, elbid)
+                            match_nlb_arn = re.match(pattern_elbv2_nlb, elbid)
+                            match_classic_name = re.match(pattern_elbname, elbid)
+
+                            if match_app_arn:
+                                LogDestinationBucket =  LogDestinationBucketPrefix + '-alb-accesslog'
+                            elif match_nlb_arn:
+                                LogDestinationBucket =  LogDestinationBucketPrefix + '-nlb-accesslog'
+                            elif match_classic_name: 
+                                LogDestinationBucket =  LogDestinationBucketPrefix + '-clb-accesslog'
+
+                            print("LogDestinationBucket :"  + LogDestinationBucket)
+
+                            if match_app_arn or match_nlb_arn:
+                                response_attr = elbv2client.describe_load_balancer_attributes(
+                                    LoadBalancerArn = elbid
+                                )
+                                print("--|| Examning Attributes of : " + elbid )
+                                for lbtemp in response_attr['Attributes']:
+                                    if lbtemp['Key'] == 'access_logs.s3.enabled':
+                                        if lbtemp['Value'] == 'false':
+                                            if match_app_arn:
+                                                print("--|| Modifying Attributes of ALB : " + elbid )
+                                                response = elbv2client.modify_load_balancer_attributes(
+                                                    LoadBalancerArn= elbid,
+                                                    Attributes=[
+                                                        {
+                                                            'Key': 'access_logs.s3.enabled',
+                                                            'Value': 'true',
+                                                        },
+                                                        {
+                                                            'Key': 'idle_timeout.timeout_seconds',
+                                                            'Value': '60',
+                                                        },
+                                                        {
+                                                            'Key': 'access_logs.s3.prefix',
+                                                            'Value': my_region,
+                                                        },
+                                                        {
+                                                            'Key': 'access_logs.s3.bucket',
+                                                            'Value': LogDestinationBucket,
+                                                        },                                                                
+                                                    ]
+                                                )
+                                            elif match_nlb_arn:
+                                                print("--|| Modifying Attributes of NLB : " + elbid )
+                                                response = elbv2client.modify_load_balancer_attributes(
+                                                    LoadBalancerArn= elbid,
+                                                    Attributes=[
+                                                        {
+                                                            'Key': 'access_logs.s3.enabled',
+                                                            'Value': 'true',
+                                                        },
+                                                        {
+                                                            'Key': 'access_logs.s3.prefix',
+                                                            'Value': my_region,
+                                                        },
+                                                        {
+                                                            'Key': 'access_logs.s3.bucket',
+                                                            'Value': LogDestinationBucket,
+                                                        },                                                                
+                                                    ]
+                                                )
+                                            print("--|| Appying tag to ELB : " + elbid )
+                                            tag_creation = elbv2client.add_tags( ResourceArns=[elbid], Tags=[ { 'Key': 'ELB-Access-logs', 'Value': 'Enabled' }, ])
+                                            SuccessfulELBs.append(elbid)
+                                        else:
+                                            for lbtemp in response_attr['Attributes']:
+                                                if lbtemp['Key'] == 'access_logs.s3.bucket':
+                                                    if lbtemp['Value'] == LogDestinationBucket:
+                                                        print("--|| Appying tag to ELB, it already has correct access log configured : " + elbid )
+                                                        #no need to check tag, config will not send here with tag
+                                                        tag_creation = elbv2client.add_tags(ResourceArns=[elbid], Tags=[ { 'Key': 'ELB-Access-logs', 'Value': 'Enabled' }, ])
+                                                        SuccessfulELBs.append(elbid)
+                                                    else:
+                                                        FailedELBs.append({"ELBId": elbid , "error": "logs already enabled with different log bucket"})
+                            elif match_classic_name:
+                                print("--|| Examning Attributes of Classic ELB : " + elbid )
+                                response_attr = elbv1client.describe_load_balancer_attributes(
+                                    LoadBalancerName = elbid
+                                )
+                                if response_attr['LoadBalancerAttributes']['AccessLog']['Enabled'] == False:                    
+                                    print("--|| Modifying Attributes of Classic ELB : " + elbid )
+                                    response = elbv1client.modify_load_balancer_attributes(
+                                        LoadBalancerName= elbid,
+                                        LoadBalancerAttributes={
+                                            'AccessLog': {
+                                                'Enabled': True,
+                                                'S3BucketName': LogDestinationBucket,
+                                                # 'EmitInterval': 5,
+                                                'S3BucketPrefix': my_region
+                                            }
+                                        }
+                                    )
+                                    tag_creation = elbv1client.add_tags( LoadBalancerNames=[elbid], Tags=[ { 'Key': 'ELB-Access-logs', 'Value': 'Enabled' }, ])
+                                    SuccessfulELBs.append(elbid)
+                                    #print("\n response\n\n" +str(response))
+                                else:
+                                    if response_attr['LoadBalancerAttributes']['AccessLog']['S3BucketName'] == LogDestinationBucket:                    
+                                        #no need to check tag, config will not send here with tag
+                                        print("--|| Appying tag to Classic ELB, it already has correct access log configured : " + elbid )
+                                        tag_creation = elbv1client.add_tags( LoadBalancerNames=[elbid], Tags=[ { 'Key': 'ELB-Access-logs', 'Value': 'Enabled' }, ])
+                                        #print("\n same bucket\n")
+                                        SuccessfulELBs.append(elbid)
+                                    else:
+                                        #raise exception
+                                        FailedELBs.append({"Elbid": elbid , "error": "logs already enabled with different log bucket"})                       
+
+                        except Exception as e :
+                            print(traceback.format_exc())
+                            print(sys.exc_info()[2])
+                            print("exception :" + str(e))
+                            FailedELBs.append({"ELBId": elbid, "error":  str(e)})
+                    return {
+                        'SuccessfulELBs': SuccessfulELBs,
+                        'FailedELBs': FailedELBs
+                    }                    
+            outputs:
+              - Name: SuccessfulELBs
+                Selector: $.Payload.SuccessfulELBs
+                Type: StringList
+              - Name: FailedELBs
+                Selector: $.Payload.FailedELBs
+                Type: MapList
+      DocumentFormat: YAML
+      DocumentType: Automation
+      Name: !Sub "AWS-EnableELBAccessLogs"
+      TargetType: /
+
+  ConfigRuleForELBAccessLogsTagging: 
+    Type: AWS::Config::ConfigRule
+    Properties: 
+      ConfigRuleName: !Ref CustomConfigRuleName
+      Description: ConfigPermissionToInvokeAnAutomaticRemediation
+      InputParameters:
+        tag1Key: !Ref tag1Key
+        tag1Value: !Ref tag1Value
+      Scope: 
+        ComplianceResourceTypes: 
+          - AWS::ElasticLoadBalancing::LoadBalancer
+          - AWS::ElasticLoadBalancingV2::LoadBalancer
+      Source: 
+        Owner: AWS
+        SourceIdentifier: REQUIRED_TAGS
+
+  ELBAccessLogsRemediationConfiguration:
+    DependsOn: 
+    - ConfigRuleForELBAccessLogsTagging
+    - SSMDocumentAWSEnableELBAccessLogs
+    Type: AWS::Config::RemediationConfiguration
+    Properties:
+        ConfigRuleName: !Ref CustomConfigRuleName
+        Automatic: true
+        MaximumAutomaticAttempts: 5
+        RetryAttemptSeconds: 50 #seconds
+        Parameters:
+          ELBIds: 
+            ResourceValue:
+              Value: 'RESOURCE_ID'
+          LogDestinationType: 
+            StaticValue:
+              Values: 
+                - s3
+          LogDestinationBucketPrefix:
+            StaticValue:
+              Values: 
+                - !Sub '${LogDestinationBucketAccountID}-${AWS::Region}'
+          AutomationAssumeRole:
+            StaticValue:
+              Values: 
+                - !Sub arn:aws:iam::${AWS::AccountId}:role/${ConfigRemediationRoleName}
+        TargetId: AWS-EnableELBAccessLogs
+        TargetType: SSM_DOCUMENT
+        TargetVersion: 1
+
+Outputs:
+  ConfigRuleForELBAccessLogsTaggingArn:
+    Description: Arn of the AWS Config Rule to enable ELB Access Logs
+    Value: !GetAtt ConfigRuleForELBAccessLogsTagging.Arn
